@@ -175,6 +175,7 @@ struct AgentExecutableResolver {
             let candidatePath = candidateURL.path
             guard fileManager.isExecutableFile(atPath: candidatePath) else { continue }
             guard !isBundledProviderExecutable(candidateURL) else { continue }
+            guard !isKnownCmuxClaudeCommandShim(candidateURL, provider: provider) else { continue }
             guard !isKnownCmuxClaudeWrapper(candidateURL, provider: provider) else { continue }
 
             return launchPlan(provider: provider, executableURL: candidateURL, searchDirectories: searchDirectories)
@@ -302,6 +303,7 @@ struct AgentExecutableResolver {
               !isDirectory.boolValue,
               fileManager.isExecutableFile(atPath: candidateURL.path),
               !isBundledProviderExecutable(candidateURL),
+              !isKnownCmuxClaudeCommandShim(candidateURL, provider: provider),
               !isKnownCmuxClaudeWrapper(candidateURL, provider: provider) else {
             return nil
         }
@@ -316,6 +318,36 @@ struct AgentExecutableResolver {
             .path,
            standardized == bundleBin {
             return true
+        }
+        return false
+    }
+
+    private func isKnownCmuxClaudeCommandShim(_ url: URL, provider: AgentSessionProviderID) -> Bool {
+        guard provider == .claude else { return false }
+        let candidatePath = url.standardizedFileURL.path
+        if let shimPath = environment["CMUX_CLAUDE_WRAPPER_SHIM"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !shimPath.isEmpty,
+           candidatePath == URL(fileURLWithPath: shimPath, isDirectory: false).standardizedFileURL.path {
+            return true
+        }
+
+        let shimRoots: [String?] = [
+            environment["CMUX_CLAUDE_WRAPPER_SHIM_ROOT"],
+            URL(fileURLWithPath: environment["TMPDIR"] ?? NSTemporaryDirectory(), isDirectory: true)
+                .appendingPathComponent("cmux-cli-shims", isDirectory: true)
+                .standardizedFileURL
+                .path,
+            "/tmp/cmux-cli-shims",
+        ]
+        for shimRoot in shimRoots {
+            guard let shimRoot = shimRoot?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !shimRoot.isEmpty else { continue }
+            let standardizedRoot = URL(fileURLWithPath: shimRoot, isDirectory: true)
+                .standardizedFileURL
+                .path
+            if candidatePath.hasPrefix(standardizedRoot + "/") {
+                return true
+            }
         }
         return false
     }
