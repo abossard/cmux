@@ -5,6 +5,7 @@ extension SessionAgent {
         switch self {
         case .claude: return String(localized: "sessionIndex.agent.claude", defaultValue: "Claude Code")
         case .codex: return String(localized: "sessionIndex.agent.codex", defaultValue: "Codex")
+        case .copilot: return String(localized: "sessionIndex.agent.copilot", defaultValue: "GitHub Copilot")
         case .grok: return String(localized: "sessionIndex.agent.grok", defaultValue: "Grok")
         case .opencode: return String(localized: "sessionIndex.agent.opencode", defaultValue: "OpenCode")
         case .rovodev: return String(localized: "sessionIndex.agent.rovodev", defaultValue: "Rovo Dev")
@@ -19,6 +20,7 @@ extension SessionAgent {
         switch self {
         case .claude: return "AgentIcons/Claude"
         case .codex: return "AgentIcons/Codex"
+        case .copilot: return "AgentIcons/Copilot"
         case .grok: return "AgentIcons/Grok"
         case .opencode: return "AgentIcons/OpenCode"
         case .rovodev: return "AgentIcons/RovoDev"

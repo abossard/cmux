@@ -486,6 +486,8 @@ private extension SessionAgent {
             )
         case .codex:
             return .codex(model: nil, approvalPolicy: nil, sandboxMode: nil, effort: nil)
+        case .copilot:
+            return .copilot(model: nil)
         case .grok:
             return .grok(model: nil, permissionMode: nil, sandboxMode: nil, grokHome: nil)
         case .opencode:

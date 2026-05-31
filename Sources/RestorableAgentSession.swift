@@ -552,13 +552,9 @@ enum AgentResumeCommandBuilder {
             guard let preserved = AgentLaunchSanitizer.preservedArguments(kind: "hermes-agent", args: original.tail) else { return nil }
             return [original.executable] + preserved + ["--resume", sessionId]
         case .copilot:
-            return resumeWithOption(
-                kind: "copilot",
-                launchCommand: launchCommand,
-                fallbackExecutable: "copilot",
-                option: "--resume",
-                sessionId: sessionId
-            )
+            let original = commandParts(launchCommand: launchCommand, fallbackExecutable: "copilot")
+            guard let preserved = AgentLaunchSanitizer.preservedArguments(kind: "copilot", args: original.tail) else { return nil }
+            return [original.executable, "--resume=\(sessionId)"] + preserved
         case .codebuddy:
             return resumeWithOption(
                 kind: "codebuddy",

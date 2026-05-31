@@ -1,6 +1,10 @@
 <h1 align="center">cmux</h1>
 <p align="center">A Ghostty-based macOS terminal with vertical tabs and notifications for AI coding agents</p>
 
+> **Fork notice** — This is a personal fork of [manaflow-ai/cmux](https://github.com/manaflow-ai/cmux).
+> Changes here include Copilot agent-hook improvements, session index enhancements, and shortcut/command-palette tests.
+> For the official release, visit the [upstream repository](https://github.com/manaflow-ai/cmux).
+
 <p align="center">
   <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
     <img src="./docs/assets/macos-badge.png" alt="Download cmux for macOS" width="180" />

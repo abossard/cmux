@@ -638,7 +638,7 @@ struct CmuxTaskManagerCodingAgentDefinition: Equatable {
         CmuxTaskManagerCodingAgentDefinition(
             id: "copilot",
             displayName: "Copilot",
-            assetName: nil,
+            assetName: "AgentIcons/Copilot",
             launchKinds: ["copilot"],
             directBasenames: ["copilot"],
             argumentNeedles: ["copilot"]

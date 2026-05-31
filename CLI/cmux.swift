@@ -2750,6 +2750,9 @@ struct CMUXCLI {
         if normalizedCommand == "surface-resume" {
             return false
         }
+        if normalizedCommand == "set-agent-lifecycle" {
+            return false
+        }
         if normalizedCommand == "surface", commandArgs.first?.lowercased() == "resume" {
             return false
         }
@@ -3175,6 +3178,28 @@ struct CMUXCLI {
 
         case "agent-hibernation":
             try runAgentHibernation(commandArgs: commandArgs, client: client, jsonOutput: jsonOutput)
+
+        case "set-agent-lifecycle":
+            guard commandArgs.count >= 2 else {
+                throw CLIError(message: "Usage: cmux set-agent-lifecycle <key> <unknown|running|idle|needsInput> [--workspace <id>] [--panel <id>]")
+            }
+            let lifecycleKey = commandArgs[0]
+            let lifecycleStateRaw = commandArgs[1]
+            guard let lifecycleState = AgentHibernationLifecycleState.parseCLIValue(lifecycleStateRaw) else {
+                throw CLIError(message: "Invalid lifecycle state '\(lifecycleStateRaw)' — must be unknown, running, idle, or needsInput")
+            }
+            let remainingArgs = Array(commandArgs.dropFirst(2))
+            let wsArg = optionValue(remainingArgs, name: "--workspace") ?? optionValue(remainingArgs, name: "--tab") ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]
+            let sfArg = optionValue(remainingArgs, name: "--panel") ?? optionValue(remainingArgs, name: "--surface") ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]
+            guard let resolvedWs = wsArg else {
+                throw CLIError(message: "set-agent-lifecycle requires a workspace (via --workspace, --tab, or CMUX_WORKSPACE_ID environment)")
+            }
+            var v1Cmd = "set_agent_lifecycle \(lifecycleKey) \(lifecycleState.rawValue) --tab=\(resolvedWs)"
+            if let sfArg {
+                v1Cmd += " --panel=\(sfArg)"
+            }
+            let response = try sendV1Command(v1Cmd, client: client)
+            print(response)
 
         case "auth", "login", "logout":
             let authArgs = command == "auth" ? commandArgs : [command] + commandArgs
@@ -12703,6 +12728,17 @@ struct CMUXCLI {
 
             Enable or disable Agent Hibernation.
             Configure idle and live-terminal limits from Settings or cmux settings JSON.
+            """
+        case "set-agent-lifecycle":
+            return """
+            Usage: cmux set-agent-lifecycle <key> <state> [--workspace <id>] [--panel <id>]
+
+            Set the lifecycle state of an agent for sidebar display.
+            States: unknown, running, idle, needsInput
+            Keys: copilot, claude_code, amp, codex, cursor, gemini, etc.
+
+            Workspace and panel default to CMUX_WORKSPACE_ID and CMUX_SURFACE_ID
+            environment variables when not specified.
             """
         case "restore-session":
             return """
@@ -24460,7 +24496,10 @@ struct CMUXCLI {
                 [original.executable] + $0 + ["--resume", sessionId]
             }
         case "copilot":
-            return agentSurfaceResumeWithOption(kind: kind, launchCommand: launchCommand, fallbackExecutable: "copilot", option: "--resume", sessionId: sessionId)
+            let original = agentSurfaceResumeCommandParts(launchCommand: launchCommand, fallbackExecutable: "copilot")
+            return AgentLaunchSanitizer.preservedArguments(kind: kind, args: original.tail).map {
+                [original.executable, "--resume=\(sessionId)"] + $0
+            }
         case "codebuddy":
             return agentSurfaceResumeWithOption(kind: kind, launchCommand: launchCommand, fallbackExecutable: "codebuddy", option: "--resume", sessionId: sessionId)
         case "factory":
@@ -24736,6 +24775,10 @@ struct CMUXCLI {
                 var entries = result[event.agentEvent] as? [[String: Any]] ?? []
                 entries.append(["command": cmd])
                 result[event.agentEvent] = entries
+            case .copilotFlat(let timeoutMs):
+                var entries = result[event.agentEvent] as? [[String: Any]] ?? []
+                entries.append(["command": cmd, "timeout": timeoutMs] as [String: Any])
+                result[event.agentEvent] = entries
             case .nested(let timeoutMs):
                 var groups = result[event.agentEvent] as? [[String: Any]] ?? []
                 let timeout = nestedHookTimeout(timeoutMs, for: def)
@@ -24766,6 +24809,10 @@ struct CMUXCLI {
             case .flat:
                 var entries = result[agentEvent] as? [[String: Any]] ?? []
                 entries.append(["command": feedCmd])
+                result[agentEvent] = entries
+            case .copilotFlat:
+                var entries = result[agentEvent] as? [[String: Any]] ?? []
+                entries.append(["command": feedCmd, "timeout": feedTimeoutMs] as [String: Any])
                 result[agentEvent] = entries
             case .nested:
                 var groups = result[agentEvent] as? [[String: Any]] ?? []
@@ -25796,6 +25843,38 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
                 } else {
                     hooks[event] = rewrittenEntries
                 }
+            case .copilotFlat:
+                // Prune both flat entries AND legacy nested-format entries
+                // (previous installs used .nested which wrapped commands in { hooks: [...] })
+                guard let entries = value as? [[String: Any]] else { continue }
+                var rewrittenEntries: [[String: Any]] = []
+                for entry in entries {
+                    // Flat format: { "command": "..." }
+                    if isCmuxOwnedCommand(entry["command"] as? String ?? "") {
+                        Self.appendCmuxHookInsertionIndex(
+                            rewrittenEntries.count,
+                            for: event,
+                            to: &cmuxInsertionIndexes
+                        )
+                        continue
+                    }
+                    // Legacy nested format: { "hooks": [{ "command": "..." }] }
+                    if let hookList = entry["hooks"] as? [[String: Any]],
+                       hookList.contains(where: { isCmuxOwnedCommand($0["command"] as? String ?? "") }) {
+                        Self.appendCmuxHookInsertionIndex(
+                            rewrittenEntries.count,
+                            for: event,
+                            to: &cmuxInsertionIndexes
+                        )
+                        continue
+                    }
+                    rewrittenEntries.append(entry)
+                }
+                if rewrittenEntries.isEmpty {
+                    hooks.removeValue(forKey: event)
+                } else {
+                    hooks[event] = rewrittenEntries
+                }
             case .nested:
                 guard let groups = value as? [[String: Any]] else { continue }
                 var rewrittenGroups: [[String: Any]] = []
@@ -25834,7 +25913,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
         // Add new cmux entries
         for (event, value) in newHooks {
             switch def.format {
-            case .flat:
+            case .flat, .copilotFlat:
                 var entries = hooks[event] as? [[String: Any]] ?? []
                 if let newEntries = value as? [[String: Any]] {
                     if let insertionIndexes = cmuxInsertionIndexes[event], !insertionIndexes.isEmpty {
@@ -26093,6 +26172,24 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
                 guard var entries = value as? [[String: Any]] else { continue }
                 let before = entries.count
                 entries.removeAll { isCmuxOwnedCommand($0["command"] as? String ?? "") }
+                removed += before - entries.count
+                if entries.isEmpty {
+                    hooks.removeValue(forKey: event)
+                } else {
+                    hooks[event] = entries
+                }
+            case .copilotFlat:
+                // Remove both flat entries AND legacy nested-format entries
+                guard var entries = value as? [[String: Any]] else { continue }
+                let before = entries.count
+                entries.removeAll { entry in
+                    if isCmuxOwnedCommand(entry["command"] as? String ?? "") { return true }
+                    if let hookList = entry["hooks"] as? [[String: Any]],
+                       hookList.contains(where: { isCmuxOwnedCommand($0["command"] as? String ?? "") }) {
+                        return true
+                    }
+                    return false
+                }
                 removed += before - entries.count
                 if entries.isEmpty {
                     hooks.removeValue(forKey: event)
@@ -27228,12 +27325,17 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
             }
         }
 
+        var finalOutput = "{}"
+
         switch action {
         case .sessionStart:
+            if def.name == "copilot" {
+                finalOutput = try copilotSessionStartHookOutput()
+            }
             let mapped = sessionId.isEmpty ? nil : (try? store.lookup(sessionId: sessionId))
             guard let target = resolveAgentHookTarget(mapped: mapped) else {
                 didSendFeedTelemetry = true
-                print("{}")
+                print(finalOutput)
                 return
             }
             let workspaceId = target.workspaceId
@@ -28105,7 +28207,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
             break
         }
 
-        print("{}")
+        print(finalOutput)
     }
 
     // MARK: - Feed telemetry helper
@@ -29999,6 +30101,129 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
         }
     }
 
+    // MARK: - Copilot CLI Extension install/uninstall
+
+    private func bundledCopilotSkillDirectoryURL() -> URL? {
+        let fileManager = FileManager.default
+        let devURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("skills", isDirectory: true)
+            .appendingPathComponent("cmux", isDirectory: true)
+        var candidates: [URL] = []
+        if let resourceURL = Bundle.main.resourceURL {
+            candidates.append(
+                resourceURL
+                    .appendingPathComponent("skills", isDirectory: true)
+                    .appendingPathComponent("cmux", isDirectory: true)
+            )
+        }
+        if let executableURL = resolvedExecutableURL() {
+            let execDir = executableURL.deletingLastPathComponent().standardizedFileURL
+            for relativePath in [
+                "skills/cmux",
+                "../skills/cmux",
+                "../../skills/cmux",
+                "../../../Contents/Resources/skills/cmux",
+            ] {
+                candidates.append(execDir.appendingPathComponent(relativePath, isDirectory: true).standardizedFileURL)
+            }
+        }
+        candidates.append(devURL)
+
+        for url in candidates {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                continue
+            }
+            let skillURL = url.appendingPathComponent("SKILL.md", isDirectory: false)
+            guard fileManager.fileExists(atPath: skillURL.path) else { continue }
+            return url
+        }
+        return nil
+    }
+
+    private func bundledCopilotSkillSource() throws -> String {
+        guard let directoryURL = bundledCopilotSkillDirectoryURL() else {
+            throw CLIError(message: "bundled cmux Copilot skill not found")
+        }
+        let skillURL = directoryURL.appendingPathComponent("SKILL.md", isDirectory: false)
+        guard let contents = try? String(contentsOf: skillURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !contents.isEmpty else {
+            throw CLIError(message: "bundled cmux Copilot skill not found")
+        }
+        return contents
+    }
+
+    private func copilotSkillsInstallLocation() -> (url: URL, displayPath: String) {
+        if let override = ProcessInfo.processInfo.environment["COPILOT_HOME"],
+           !override.isEmpty {
+            let expanded = NSString(string: override).expandingTildeInPath
+            let baseURL = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
+            let displayBase = override.hasSuffix("/") ? String(override.dropLast()) : override
+            return (
+                baseURL
+                    .appendingPathComponent("skills", isDirectory: true)
+                    .appendingPathComponent("cmux", isDirectory: true),
+                "\(displayBase)/skills/cmux/"
+            )
+        }
+        return (
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".copilot", isDirectory: true)
+                .appendingPathComponent("skills", isDirectory: true)
+                .appendingPathComponent("cmux", isDirectory: true),
+            "~/.copilot/skills/cmux/"
+        )
+    }
+
+    private func installCopilotSkills() {
+        let fileManager = FileManager.default
+        guard let sourceURL = bundledCopilotSkillDirectoryURL() else {
+            print("Warning: bundled cmux Copilot skills not found; skipping skill install")
+            return
+        }
+        let location = copilotSkillsInstallLocation()
+        do {
+            try fileManager.createDirectory(
+                at: location.url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if fileManager.fileExists(atPath: location.url.path) {
+                try fileManager.removeItem(at: location.url)
+            }
+            try fileManager.copyItem(at: sourceURL, to: location.url)
+            print("Copilot skills installed at \(location.displayPath)")
+        } catch {
+            print("Warning: failed to install Copilot skills at \(location.displayPath): \(error.localizedDescription)")
+        }
+    }
+
+    private func uninstallCopilotSkills() {
+        let fileManager = FileManager.default
+        let location = copilotSkillsInstallLocation()
+        guard fileManager.fileExists(atPath: location.url.path) else {
+            print("No Copilot skills found at \(location.displayPath)")
+            return
+        }
+        do {
+            try fileManager.removeItem(at: location.url)
+            print("Copilot skills removed from \(location.displayPath)")
+        } catch {
+            print("Warning: failed to remove Copilot skills from \(location.displayPath): \(error.localizedDescription)")
+        }
+    }
+
+    private func copilotSessionStartHookOutput() throws -> String {
+        let additionalContext = try bundledCopilotSkillSource()
+        let data = try JSONSerialization.data(withJSONObject: ["additionalContext": additionalContext])
+        guard let output = String(data: data, encoding: .utf8) else {
+            throw CLIError(message: "Failed to encode Copilot sessionStart hook output")
+        }
+        return output
+    }
+
     // MARK: - Feed (workstream) hook bridge
 
     /// Reads an agent hook JSON payload from stdin, forwards it to the
@@ -30597,6 +30822,11 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
             try installOpenCodePlugin(projectLocal: false)
             return
         }
+        if def.name == "copilot" {
+            try installAgentHooks(def)
+            installCopilotSkills()
+            return
+        }
         try installAgentHooks(def)
     }
 
@@ -30609,6 +30839,11 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
             }
             try uninstallAgentHooks(def)
             try uninstallOpenCodePlugin(projectLocal: false)
+            return
+        }
+        if def.name == "copilot" {
+            try uninstallAgentHooks(def)
+            uninstallCopilotSkills()
             return
         }
         try uninstallAgentHooks(def)

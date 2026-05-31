@@ -37,6 +37,7 @@ struct RegisteredSessionAgent: Hashable, Sendable {
 enum SessionAgent: Identifiable, Codable, Sendable, Hashable {
     case claude
     case codex
+    case copilot
     case grok
     case opencode
     case rovodev
@@ -45,13 +46,14 @@ enum SessionAgent: Identifiable, Codable, Sendable, Hashable {
 
     var id: String { rawValue }
 
-    static let builtInCases: [SessionAgent] = [.claude, .codex, .grok, .opencode, .rovodev, .hermesAgent]
+    static let builtInCases: [SessionAgent] = [.claude, .codex, .copilot, .grok, .opencode, .rovodev, .hermesAgent]
 
     init?(rawValue: String) {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         switch value {
         case "claude": self = .claude
         case "codex": self = .codex
+        case "copilot": self = .copilot
         case "grok": self = .grok
         case "opencode": self = .opencode
         case "rovodev": self = .rovodev
@@ -66,6 +68,7 @@ enum SessionAgent: Identifiable, Codable, Sendable, Hashable {
         switch self {
         case .claude: return "claude"
         case .codex: return "codex"
+        case .copilot: return "copilot"
         case .grok: return "grok"
         case .opencode: return "opencode"
         case .rovodev: return "rovodev"
@@ -198,6 +201,7 @@ struct PullRequestLink: Hashable {
 enum AgentSpecifics: Hashable {
     case claude(model: String?, permissionMode: String?, configDirectoryForResume: String?)
     case codex(model: String?, approvalPolicy: String?, sandboxMode: String?, effort: String?)
+    case copilot(model: String?)
     case grok(model: String?, permissionMode: String?, sandboxMode: String?, grokHome: String?)
     case opencode(providerModel: String?, agentName: String?)
     case rovodev
@@ -368,6 +372,12 @@ struct SessionEntry: Identifiable, Hashable {
             return parts.joined(separator: " ")
         case .rovodev:
             return "acli rovodev run --restore \(Self.shellQuote(sessionId))"
+        case .copilot(let model):
+            var parts = ["copilot", "--resume=\(sessionId)"]
+            if let model, !model.isEmpty {
+                parts.append("--model \(Self.shellQuote(model))")
+            }
+            return parts.joined(separator: " ")
         case let .hermesAgent(source, model, hermesHome):
             return Self.hermesResumeCommand(
                 sessionId: sessionId,

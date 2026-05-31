@@ -859,6 +859,66 @@ final class CommandPaletteSelectionScrollBehaviorTests: XCTestCase {
 }
 
 
+@MainActor
+private final class ShortcutHintTestWindow: NSWindow {
+    var forcedIsKeyWindow = true
+
+    override var isKeyWindow: Bool {
+        forcedIsKeyWindow
+    }
+}
+
+@MainActor
+private final class ShortcutHintTestScheduler {
+    private struct Entry {
+        var nextFireTime: TimeInterval
+        let interval: TimeInterval?
+        let action: @MainActor () -> Void
+    }
+
+    private var now: TimeInterval = 0
+    private var entries: [UUID: Entry] = [:]
+
+    func schedule(_ delay: TimeInterval, _ action: @escaping @MainActor () -> Void) -> ShortcutHintScheduledTask {
+        register(delay: delay, interval: nil, action: action)
+    }
+
+    func scheduleRepeating(_ interval: TimeInterval, _ action: @escaping @MainActor () -> Void) -> ShortcutHintScheduledTask {
+        register(delay: interval, interval: interval, action: action)
+    }
+
+    func advance(by delta: TimeInterval) {
+        let targetTime = now + delta
+        while let nextEntry = entries.min(by: { lhs, rhs in
+            lhs.value.nextFireTime < rhs.value.nextFireTime
+        }), nextEntry.value.nextFireTime <= targetTime {
+            let id = nextEntry.key
+            let entry = nextEntry.value
+            now = entry.nextFireTime
+            if entry.interval == nil {
+                entries.removeValue(forKey: id)
+            }
+            entry.action()
+            if let interval = entry.interval, entries[id] != nil {
+                entries[id]?.nextFireTime = now + interval
+            }
+        }
+        now = targetTime
+    }
+
+    private func register(
+        delay: TimeInterval,
+        interval: TimeInterval?,
+        action: @escaping @MainActor () -> Void
+    ) -> ShortcutHintScheduledTask {
+        let id = UUID()
+        entries[id] = Entry(nextFireTime: now + delay, interval: interval, action: action)
+        return ShortcutHintScheduledTask { [weak self] in
+            self?.entries.removeValue(forKey: id)
+        }
+    }
+}
+
 final class ShortcutHintModifierPolicyTests: XCTestCase {
     func testTitlebarShortcutHintActionSlotsIncludeFocusHistoryNavigation() {
         XCTAssertEqual(
@@ -1068,6 +1128,235 @@ final class ShortcutHintModifierPolicyTests: XCTestCase {
                 )
             )
         }
+    }
+
+    @MainActor
+    func testRightSidebarStaleCheckHidesVisibleHintWhenModifierFlagsDropWithoutNewEvents() {
+        let scheduler = ShortcutHintTestScheduler()
+        var currentFlags: NSEvent.ModifierFlags = [.command]
+        let (monitor, _) = makeVisibleRightSidebarMonitor(
+            scheduler: scheduler,
+            modifierFlagsProvider: { currentFlags }
+        )
+
+        currentFlags = []
+        scheduler.advance(by: ShortcutHintStaleModifierRecovery.pollInterval)
+
+        XCTAssertFalse(monitor.isModifierPressed)
+    }
+
+    @MainActor
+    func testRightSidebarStaleCheckKeepsVisibleHintWhileModifierRemainsHeld() {
+        let scheduler = ShortcutHintTestScheduler()
+        var currentFlags: NSEvent.ModifierFlags = [.command]
+        let (monitor, _) = makeVisibleRightSidebarMonitor(
+            scheduler: scheduler,
+            modifierFlagsProvider: { currentFlags }
+        )
+
+        scheduler.advance(by: ShortcutHintStaleModifierRecovery.pollInterval * 2)
+
+        XCTAssertTrue(monitor.isModifierPressed)
+    }
+
+    @MainActor
+    func testRightSidebarExplicitResetEventsHideVisibleHintImmediately() {
+        let resetTriggers: [(String, @MainActor (WindowScopedShortcutHintModifierMonitor, ShortcutHintTestWindow) -> Void)] = [
+            ("keyDown", { monitor, window in
+                monitor.handleKeyDown(eventWindow: window)
+            }),
+            ("hostWindowDidResignKey", { monitor, _ in
+                monitor.handleHostWindowDidResignKey()
+            }),
+            ("applicationDidResignActive", { monitor, _ in
+                monitor.handleApplicationDidResignActive()
+            }),
+            ("stop", { monitor, _ in
+                monitor.stop()
+            }),
+        ]
+
+        for (name, trigger) in resetTriggers {
+            XCTContext.runActivity(named: name) { _ in
+                let scheduler = ShortcutHintTestScheduler()
+                var currentFlags: NSEvent.ModifierFlags = [.command]
+                let (monitor, window) = makeVisibleRightSidebarMonitor(
+                    scheduler: scheduler,
+                    modifierFlagsProvider: { currentFlags }
+                )
+
+                trigger(monitor, window)
+
+                XCTAssertFalse(monitor.isModifierPressed)
+                currentFlags = []
+                scheduler.advance(by: ShortcutHintStaleModifierRecovery.pollInterval)
+                XCTAssertFalse(monitor.isModifierPressed)
+            }
+        }
+    }
+
+    @MainActor
+    func testRightSidebarIntentionalHoldDelayPreventsEarlyHintVisibility() {
+        let scheduler = ShortcutHintTestScheduler()
+        var currentFlags: NSEvent.ModifierFlags = [.command]
+        let (monitor, window) = makeRightSidebarMonitor(
+            scheduler: scheduler,
+            modifierFlagsProvider: { currentFlags }
+        )
+
+        monitor.handleFlagsChanged(currentFlags, eventWindow: window)
+        scheduler.advance(by: ShortcutHintModifierPolicy.intentionalHoldDelay - 0.01)
+        XCTAssertFalse(monitor.isModifierPressed)
+
+        scheduler.advance(by: 0.01)
+
+        XCTAssertTrue(monitor.isModifierPressed)
+    }
+
+    @MainActor
+    func testRightSidebarLocalReleaseEventHidesVisibleHintWithoutWaitingForStaleCheck() {
+        let scheduler = ShortcutHintTestScheduler()
+        var currentFlags: NSEvent.ModifierFlags = [.command]
+        let (monitor, window) = makeVisibleRightSidebarMonitor(
+            scheduler: scheduler,
+            modifierFlagsProvider: { currentFlags }
+        )
+
+        currentFlags = []
+        monitor.handleFlagsChanged(currentFlags, eventWindow: window)
+
+        XCTAssertFalse(monitor.isModifierPressed)
+    }
+
+    @MainActor
+    func testTitlebarStaleCheckPostsHiddenVisibilityWhenModifierFlagsDropWithoutNewEvents() {
+        let scheduler = ShortcutHintTestScheduler()
+        var currentFlags: NSEvent.ModifierFlags = [.command]
+        var recordedStates: [Bool] = []
+        let observer = NotificationCenter.default.addObserver(
+            forName: .titlebarShortcutHintsVisibilityChanged,
+            object: nil,
+            queue: nil
+        ) { notification in
+            recordedStates.append(notification.userInfo?["visible"] as? Bool ?? false)
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+
+        let (monitor, _) = makeVisibleTitlebarMonitor(
+            scheduler: scheduler,
+            modifierFlagsProvider: { currentFlags }
+        )
+        XCTAssertTrue(monitor.isModifierPressed)
+
+        currentFlags = []
+        scheduler.advance(by: ShortcutHintStaleModifierRecovery.pollInterval)
+
+        XCTAssertEqual(recordedStates, [true, false])
+    }
+
+    @MainActor
+    func testTitlebarStaleCheckDoesNotHideVisibleHintWhileModifierRemainsHeld() {
+        let scheduler = ShortcutHintTestScheduler()
+        var currentFlags: NSEvent.ModifierFlags = [.command]
+        var recordedStates: [Bool] = []
+        let observer = NotificationCenter.default.addObserver(
+            forName: .titlebarShortcutHintsVisibilityChanged,
+            object: nil,
+            queue: nil
+        ) { notification in
+            recordedStates.append(notification.userInfo?["visible"] as? Bool ?? false)
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+
+        let (monitor, _) = makeVisibleTitlebarMonitor(
+            scheduler: scheduler,
+            modifierFlagsProvider: { currentFlags }
+        )
+
+        scheduler.advance(by: ShortcutHintStaleModifierRecovery.pollInterval * 2)
+
+        XCTAssertTrue(monitor.isModifierPressed)
+        XCTAssertEqual(recordedStates, [true])
+    }
+
+    @MainActor
+    private func makeRightSidebarMonitor(
+        scheduler: ShortcutHintTestScheduler,
+        activation: ShortcutHintModifierActivation = .commandOrControl,
+        allowsHintsForWindow: @escaping (NSWindow) -> Bool = { _ in true },
+        modifierFlagsProvider: @escaping () -> NSEvent.ModifierFlags
+    ) -> (WindowScopedShortcutHintModifierMonitor, ShortcutHintTestWindow) {
+        let window = ShortcutHintTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 180),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let monitor = WindowScopedShortcutHintModifierMonitor(
+            activation: activation,
+            allowsHintsForWindow: allowsHintsForWindow,
+            modifierFlagsProvider: modifierFlagsProvider,
+            keyWindowProvider: { window },
+            scheduleDelayed: { delay, action in
+                scheduler.schedule(delay, action)
+            },
+            scheduleRepeating: { interval, action in
+                scheduler.scheduleRepeating(interval, action)
+            }
+        )
+        monitor.setHostWindow(window)
+        return (monitor, window)
+    }
+
+    @MainActor
+    private func makeVisibleRightSidebarMonitor(
+        scheduler: ShortcutHintTestScheduler,
+        activation: ShortcutHintModifierActivation = .commandOrControl,
+        allowsHintsForWindow: @escaping (NSWindow) -> Bool = { _ in true },
+        modifierFlagsProvider: @escaping () -> NSEvent.ModifierFlags
+    ) -> (WindowScopedShortcutHintModifierMonitor, ShortcutHintTestWindow) {
+        let (monitor, window) = makeRightSidebarMonitor(
+            scheduler: scheduler,
+            activation: activation,
+            allowsHintsForWindow: allowsHintsForWindow,
+            modifierFlagsProvider: modifierFlagsProvider
+        )
+        monitor.handleFlagsChanged(modifierFlagsProvider(), eventWindow: window)
+        scheduler.advance(by: ShortcutHintModifierPolicy.intentionalHoldDelay)
+        XCTAssertTrue(monitor.isModifierPressed)
+        return (monitor, window)
+    }
+
+    @MainActor
+    private func makeVisibleTitlebarMonitor(
+        scheduler: ShortcutHintTestScheduler,
+        modifierFlagsProvider: @escaping () -> NSEvent.ModifierFlags
+    ) -> (TitlebarShortcutHintModifierMonitor, ShortcutHintTestWindow) {
+        let window = ShortcutHintTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 180),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let monitor = TitlebarShortcutHintModifierMonitor(
+            modifierFlagsProvider: modifierFlagsProvider,
+            keyWindowProvider: { window },
+            scheduleDelayed: { delay, action in
+                scheduler.schedule(delay, action)
+            },
+            scheduleRepeating: { interval, action in
+                scheduler.scheduleRepeating(interval, action)
+            }
+        )
+        monitor.setHostWindow(window)
+        monitor.handleFlagsChanged(modifierFlagsProvider(), eventWindow: window)
+        scheduler.advance(by: ShortcutHintModifierPolicy.intentionalHoldDelay)
+        XCTAssertTrue(monitor.isModifierPressed)
+        return (monitor, window)
     }
 
     private func withDefaultsSuite(_ body: (UserDefaults) -> Void) {

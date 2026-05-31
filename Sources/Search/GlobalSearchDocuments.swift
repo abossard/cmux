@@ -44,10 +44,10 @@ enum GlobalSearchDocuments {
             workspaceID: context.workspaceID,
             panelID: context.panelID,
             kind: kind,
-            title: context.panelTitle,
+            title: context.workspaceTitle,
             location: "",
             anchor: "panel",
-            snippet: context.location,
+            snippet: context.panelTitle,
             rank: 0,
             timestamp: .now
         )

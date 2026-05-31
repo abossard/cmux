@@ -1269,6 +1269,7 @@ final class SessionIndexStore: ObservableObject {
         switch agent {
         case .claude: return await loadClaudeEntries(needle: needle, cwdFilter: cwdFilter, offset: offset, limit: limit)
         case .codex: return await loadCodexEntries(needle: needle, cwdFilter: cwdFilter, offset: offset, limit: limit, errorBag: errorBag)
+        case .copilot: return await loadCopilotEntries(needle: needle, cwdFilter: cwdFilter, offset: offset, limit: limit)
         case .grok:
             return await loadGrokEntries(
                 registration: registry.registration(id: "grok") ?? .builtInGrok,
@@ -1552,6 +1553,18 @@ final class SessionIndexStore: ObservableObject {
         cmuxDebugLog("session.claude.detail target=\(target) workSize=\(workSize) matched=\(matched.count) cachedHits=\(cachedCount) skipped=\(skippedCount) parallelMs=\(Int(totalMs))")
         #endif
         return Array(matched.prefix(target).dropFirst(offset).prefix(limit))
+    }
+
+    /// Returns Copilot CLI session entries by scanning `~/.copilot/session-state/`.
+    nonisolated private static func loadCopilotEntries(
+        needle: String, cwdFilter: String?, offset: Int, limit: Int
+    ) async -> [SessionEntry] {
+        return CopilotSessionLocator.enumerateSessions(
+            needle: needle,
+            cwdFilter: cwdFilter,
+            offset: offset,
+            limit: limit
+        )
     }
 
     /// Returns Codex session entries paginated by mtime desc.

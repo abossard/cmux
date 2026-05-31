@@ -57,3 +57,4 @@ tmp-*/
 
 # Local dogfood scratch (screenshots, recordings) — never commit
 artifacts/
+.deriveddata/

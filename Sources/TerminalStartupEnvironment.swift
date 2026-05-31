@@ -20,6 +20,11 @@ extension TerminalSurface {
         "CLAUDE_CODE_USE_VERTEX"
     ]
 
+    private static let inheritedGitHubAuthEnvironmentKeys: Set<String> = [
+        "GITHUB_TOKEN",
+        "GH_TOKEN"
+    ]
+
     static func applyManagedTerminalIdentityEnvironment(
         to environment: inout [String: String],
         protectedKeys: inout Set<String>
@@ -74,6 +79,11 @@ extension TerminalSurface {
         var merged = base
         for key in inheritedClaudeAuthSelectionEnvironmentKeys where merged[key] != nil || ambientEnvironment[key] != nil {
             merged[key] = ""
+        }
+        for key in inheritedGitHubAuthEnvironmentKeys where ambientEnvironment[key] != nil {
+            if merged[key] == nil {
+                merged[key] = ""
+            }
         }
         for (key, value) in additionalEnvironment where !key.isEmpty && !value.isEmpty && !protectedKeys.contains(key) {
             merged[key] = value

@@ -49,6 +49,7 @@ extension CMUXCLI {
         enum HookFormat {
             case flat       // Cursor: {"hooks": {"event": [{"command": "..."}]}, "version": 1}
             case nested(timeoutMs: Int)  // Codex/Gemini: nested with type/command/timeout
+            case copilotFlat(timeoutMs: Int) // Copilot CLI: flat [{"command": "...", "timeout": 5000}], no version key
             case antigravityJSON(timeoutSeconds: Int) // ~/.gemini/config/hooks.json named hook groups
             case rovoDevYAML
             case hermesAgentYAML
@@ -271,16 +272,17 @@ extension CMUXCLI {
         ),
         AgentHookDef(
             name: "copilot", displayName: "Copilot", statusKey: "copilot",
-            configDir: ".copilot", configFile: "config.json", configDirEnvOverride: "COPILOT_HOME",
+            configDir: ".copilot", configFile: "settings.json", configDirEnvOverride: "COPILOT_HOME",
             sessionStoreSuffix: "copilot", disableEnvVar: "CMUX_COPILOT_HOOKS_DISABLED",
-            hookMarker: "cmux hooks copilot", format: .nested(timeoutMs: 5000),
+            hookMarker: "cmux hooks copilot", format: .copilotFlat(timeoutMs: 5000),
             events: [
-                .init(agentEvent: "SessionStart", cmuxSubcommand: "session-start"),
-                .init(agentEvent: "Stop", cmuxSubcommand: "stop"),
-                .init(agentEvent: "Notification", cmuxSubcommand: "stop"),
-                .init(agentEvent: "SessionEnd", cmuxSubcommand: "session-end"),
+                .init(agentEvent: "sessionStart", cmuxSubcommand: "session-start"),
+                .init(agentEvent: "userPromptSubmitted", cmuxSubcommand: "prompt-submit"),
+                .init(agentEvent: "agentStop", cmuxSubcommand: "stop"),
+                .init(agentEvent: "notification", cmuxSubcommand: "notification"),
+                .init(agentEvent: "sessionEnd", cmuxSubcommand: "session-end"),
             ],
-            feedHookEvents: ["PreToolUse"]
+            feedHookEvents: []
         ),
         AgentHookDef(
             name: "codebuddy", displayName: "CodeBuddy", statusKey: "codebuddy",

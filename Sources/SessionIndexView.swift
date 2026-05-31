@@ -1093,6 +1093,16 @@ private enum SessionTranscriptLoader {
         Data(#""role":"#.utf8),
         Data(#""role": "#.utf8)
     ]
+    private static let copilotMessageNeedles = [
+        Data(#""type":"user.message""#.utf8),
+        Data(#""type": "user.message""#.utf8),
+        Data(#""type":"assistant.message""#.utf8),
+        Data(#""type": "assistant.message""#.utf8),
+        Data(#""type":"tool.execution_start""#.utf8),
+        Data(#""type": "tool.execution_start""#.utf8),
+        Data(#""type":"tool.execution_complete""#.utf8),
+        Data(#""type": "tool.execution_complete""#.utf8)
+    ]
     private static let grokAssistantRoleNeedles = [
         Data(#""role":"assistant""#.utf8),
         Data(#""role": "assistant""#.utf8),
@@ -1207,6 +1217,9 @@ private enum SessionTranscriptLoader {
         var isSkippingOversizedLine = false
         var oversizedPreviewRole: SessionTranscriptRole?
         var didHitTurnLimit = false
+        // Copilot tool.execution_start has toolName but tool.execution_complete
+        // only has toolCallId. Build a map so completions show the real name.
+        var copilotToolNames: [String: String] = [:]
 
         func finishLine() {
             defer {
@@ -1230,7 +1243,8 @@ private enum SessionTranscriptLoader {
                 lineData,
                 agent: agent,
                 usesGrokTranscriptLayout: usesGrokTranscriptLayout,
-                id: lineIndex
+                id: lineIndex,
+                copilotToolNames: &copilotToolNames
             ) else {
                 return
             }
@@ -1463,7 +1477,8 @@ private enum SessionTranscriptLoader {
         _ lineData: Data,
         agent: SessionAgent,
         usesGrokTranscriptLayout: Bool,
-        id: Int
+        id: Int,
+        copilotToolNames: inout [String: String]
     ) -> SessionTranscriptTurn? {
         guard !lineData.isEmpty,
               shouldParseRawLine(lineData, agent: agent, usesGrokTranscriptLayout: usesGrokTranscriptLayout),
@@ -1474,7 +1489,8 @@ private enum SessionTranscriptLoader {
             object,
             agent: agent,
             usesGrokTranscriptLayout: usesGrokTranscriptLayout,
-            id: id
+            id: id,
+            copilotToolNames: &copilotToolNames
         )
     }
 
@@ -1482,13 +1498,16 @@ private enum SessionTranscriptLoader {
         _ object: [String: Any],
         agent: SessionAgent,
         usesGrokTranscriptLayout: Bool,
-        id: Int
+        id: Int,
+        copilotToolNames: inout [String: String]
     ) -> SessionTranscriptTurn? {
         switch agent {
         case .claude:
             return parseClaudeLine(object, id: id)
         case .codex:
             return parseCodexLine(object, id: id)
+        case .copilot:
+            return parseCopilotLine(object, id: id, toolNames: &copilotToolNames)
         case .grok, .opencode, .rovodev, .registered:
             return parseGenericLine(
                 object,
@@ -1539,6 +1558,48 @@ private enum SessionTranscriptLoader {
             return SessionTranscriptTurn(id: id, role: .tool, text: text)
         }
         return nil
+    }
+
+    /// Parses a Copilot CLI events.jsonl line into a transcript turn.
+    /// Event types: user.message, assistant.message, tool.execution_start, tool.execution_complete
+    private static func parseCopilotLine(
+        _ object: [String: Any],
+        id: Int,
+        toolNames: inout [String: String]
+    ) -> SessionTranscriptTurn? {
+        guard let type = object["type"] as? String else { return nil }
+        switch type {
+        case "user.message":
+            let content = object["user_content"] as? String
+                ?? (object["data"] as? [String: Any])?["content"] as? String
+            guard let text = content, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return SessionTranscriptTurn(id: id, role: .user, text: text)
+        case "assistant.message":
+            let content = object["assistant_content"] as? String
+                ?? (object["data"] as? [String: Any])?["content"] as? String
+            guard let text = content, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return SessionTranscriptTurn(id: id, role: .assistant, text: text)
+        case "tool.execution_start":
+            let data = object["data"] as? [String: Any]
+            if let callId = data?["toolCallId"] as? String,
+               let name = data?["toolName"] as? String {
+                toolNames[callId] = name
+            }
+            return nil
+        case "tool.execution_complete":
+            let data = object["data"] as? [String: Any]
+            let callId = data?["toolCallId"] as? String ?? ""
+            let toolName = toolNames[callId] ?? "tool"
+            let success = data?["success"] as? Bool ?? true
+            let marker = success ? "✓" : "✗"
+            return SessionTranscriptTurn(id: id, role: .tool, text: "[\(marker)] \(toolName)")
+        default:
+            return nil
+        }
     }
 
     private static func parseGenericLine(
@@ -1821,6 +1882,8 @@ private enum SessionTranscriptLoader {
         case .codex:
             return containsAny(data, needles: codexResponseItemNeedles)
                 && containsAny(data, needles: codexPreviewNeedles)
+        case .copilot:
+            return containsAny(data, needles: copilotMessageNeedles)
         case .grok:
             return containsAny(data, needles: grokRoleNeedles)
         case .opencode, .rovodev:
@@ -1847,6 +1910,16 @@ private enum SessionTranscriptLoader {
             }
             if containsAny(data, needles: [Data(#""type":"user""#.utf8), Data(#""type": "user""#.utf8)]) {
                 return .user
+            }
+        case .copilot:
+            if containsAny(data, needles: [Data(#""type":"assistant.message""#.utf8), Data(#""type": "assistant.message""#.utf8)]) {
+                return .assistant
+            }
+            if containsAny(data, needles: [Data(#""type":"user.message""#.utf8), Data(#""type": "user.message""#.utf8)]) {
+                return .user
+            }
+            if containsAny(data, needles: [Data(#""type":"tool.execution_complete""#.utf8), Data(#""type": "tool.execution_complete""#.utf8)]) {
+                return .tool
             }
         case .codex, .opencode, .rovodev, .registered:
             if containsAny(data, needles: [Data(#""role":"assistant""#.utf8), Data(#""role": "assistant""#.utf8)]) {

@@ -1674,10 +1674,15 @@ private struct PassthroughHoverTrackingView: NSViewRepresentable {
 }
 
 @MainActor
-private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
+final class TitlebarShortcutHintModifierMonitor: ObservableObject {
     @Published private(set) var isModifierPressed = false {
         didSet {
             guard oldValue != isModifierPressed else { return }
+            if isModifierPressed {
+                staleModifierRecovery.start(activation: .commandOnly)
+            } else {
+                staleModifierRecovery.stop()
+            }
             NotificationCenter.default.post(
                 name: .titlebarShortcutHintsVisibilityChanged,
                 object: nil,
@@ -1686,13 +1691,35 @@ private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
         }
     }
 
+    private let modifierFlagsProvider: () -> NSEvent.ModifierFlags
+    private let keyWindowProvider: () -> NSWindow?
+    private let scheduleDelayed: (TimeInterval, @escaping @MainActor () -> Void) -> ShortcutHintScheduledTask
+    private let scheduleRepeating: (TimeInterval, @escaping @MainActor () -> Void) -> ShortcutHintScheduledTask
     private weak var hostWindow: NSWindow?
+    private lazy var staleModifierRecovery = ShortcutHintStaleModifierRecovery(
+        modifierFlagsProvider: modifierFlagsProvider,
+        scheduleRepeating: scheduleRepeating
+    ) { [weak self] in
+        self?.cancelPendingHintShow(resetVisible: true)
+    }
     private var hostWindowDidBecomeKeyObserver: NSObjectProtocol?
     private var hostWindowDidResignKeyObserver: NSObjectProtocol?
     private var flagsMonitor: Any?
     private var keyDownMonitor: Any?
     private var appResignObserver: NSObjectProtocol?
-    private var pendingShowWorkItem: DispatchWorkItem?
+    private var pendingShowTask: ShortcutHintScheduledTask?
+
+    init(
+        modifierFlagsProvider: @escaping () -> NSEvent.ModifierFlags = { NSEvent.modifierFlags },
+        keyWindowProvider: @escaping () -> NSWindow? = { NSApp.keyWindow },
+        scheduleDelayed: @escaping (TimeInterval, @escaping @MainActor () -> Void) -> ShortcutHintScheduledTask = ShortcutHintMonitorScheduler.schedule,
+        scheduleRepeating: @escaping (TimeInterval, @escaping @MainActor () -> Void) -> ShortcutHintScheduledTask = ShortcutHintMonitorScheduler.scheduleRepeating
+    ) {
+        self.modifierFlagsProvider = modifierFlagsProvider
+        self.keyWindowProvider = keyWindowProvider
+        self.scheduleDelayed = scheduleDelayed
+        self.scheduleRepeating = scheduleRepeating
+    }
 
     func setHostWindow(_ window: NSWindow?) {
         guard hostWindow !== window else { return }
@@ -1709,7 +1736,7 @@ private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.update(from: NSEvent.modifierFlags, eventWindow: nil)
+                self?.handleHostWindowDidBecomeKey()
             }
         }
 
@@ -1719,26 +1746,26 @@ private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.cancelPendingHintShow(resetVisible: true)
+                self?.handleHostWindowDidResignKey()
             }
         }
 
-        update(from: NSEvent.modifierFlags, eventWindow: nil)
+        handleHostWindowDidBecomeKey()
     }
 
     func start() {
         guard flagsMonitor == nil else {
-            update(from: NSEvent.modifierFlags, eventWindow: nil)
+            handleFlagsChanged(modifierFlagsProvider(), eventWindow: nil)
             return
         }
 
         flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            self?.update(from: event.modifierFlags, eventWindow: event.window)
+            self?.handleFlagsChanged(event.modifierFlags, eventWindow: event.window)
             return event
         }
 
         keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handleKeyDown(event)
+            self?.handleKeyDown(eventWindow: event.window)
             return event
         }
 
@@ -1748,11 +1775,11 @@ private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.cancelPendingHintShow(resetVisible: true)
+                self?.handleApplicationDidResignActive()
             }
         }
 
-        update(from: NSEvent.modifierFlags, eventWindow: nil)
+        handleFlagsChanged(modifierFlagsProvider(), eventWindow: nil)
     }
 
     func stop() {
@@ -1772,8 +1799,24 @@ private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
         cancelPendingHintShow(resetVisible: true)
     }
 
-    private func handleKeyDown(_ event: NSEvent) {
-        guard isCurrentWindow(eventWindow: event.window) else { return }
+    func handleFlagsChanged(_ modifierFlags: NSEvent.ModifierFlags, eventWindow: NSWindow?) {
+        update(from: modifierFlags, eventWindow: eventWindow)
+    }
+
+    func handleKeyDown(eventWindow: NSWindow?) {
+        guard isCurrentWindow(eventWindow: eventWindow) else { return }
+        cancelPendingHintShow(resetVisible: true)
+    }
+
+    func handleHostWindowDidBecomeKey() {
+        handleFlagsChanged(modifierFlagsProvider(), eventWindow: nil)
+    }
+
+    func handleHostWindowDidResignKey() {
+        cancelPendingHintShow(resetVisible: true)
+    }
+
+    func handleApplicationDidResignActive() {
         cancelPendingHintShow(resetVisible: true)
     }
 
@@ -1782,18 +1825,13 @@ private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
             hostWindowNumber: hostWindow?.windowNumber,
             hostWindowIsKey: hostWindow?.isKeyWindow ?? false,
             eventWindowNumber: eventWindow?.windowNumber,
-            keyWindowNumber: NSApp.keyWindow?.windowNumber
+            keyWindowNumber: keyWindowProvider()?.windowNumber
         )
     }
 
     private func update(from modifierFlags: NSEvent.ModifierFlags, eventWindow: NSWindow?) {
         guard ShortcutHintModifierPolicy.shouldShowCommandHints(for: modifierFlags),
-              ShortcutHintModifierPolicy.isCurrentWindow(
-                hostWindowNumber: hostWindow?.windowNumber,
-                hostWindowIsKey: hostWindow?.isKeyWindow ?? false,
-                eventWindowNumber: eventWindow?.windowNumber,
-                keyWindowNumber: NSApp.keyWindow?.windowNumber
-              ) else {
+              isCurrentWindow(eventWindow: eventWindow) else {
             cancelPendingHintShow(resetVisible: true)
             return
         }
@@ -1802,30 +1840,23 @@ private final class TitlebarShortcutHintModifierMonitor: ObservableObject {
     }
 
     private func queueHintShow() {
-        if pendingShowWorkItem != nil || isModifierPressed {
-            return
-        }
+        guard pendingShowTask == nil else { return }
+        guard !isModifierPressed else { return }
 
-        let workItem = DispatchWorkItem { [weak self] in
+        pendingShowTask = scheduleDelayed(ShortcutHintModifierPolicy.intentionalHoldDelay) { [weak self] in
             guard let self else { return }
-            self.pendingShowWorkItem = nil
-            guard ShortcutHintModifierPolicy.shouldShowCommandHints(for: NSEvent.modifierFlags),
-                  ShortcutHintModifierPolicy.isCurrentWindow(
-                    hostWindowNumber: self.hostWindow?.windowNumber,
-                    hostWindowIsKey: self.hostWindow?.isKeyWindow ?? false,
-                    eventWindowNumber: nil,
-                    keyWindowNumber: NSApp.keyWindow?.windowNumber
-                  ) else { return }
+            self.pendingShowTask = nil
+            guard self.isCurrentWindow(eventWindow: nil),
+                  ShortcutHintModifierPolicy.shouldShowCommandHints(for: self.modifierFlagsProvider()) else {
+                return
+            }
             self.isModifierPressed = true
         }
-
-        pendingShowWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + ShortcutHintModifierPolicy.intentionalHoldDelay, execute: workItem)
     }
 
     private func cancelPendingHintShow(resetVisible: Bool) {
-        pendingShowWorkItem?.cancel()
-        pendingShowWorkItem = nil
+        pendingShowTask?.cancel()
+        pendingShowTask = nil
         if resetVisible {
             isModifierPressed = false
         }
